@@ -1,8 +1,8 @@
 # pdf-to-db
 
 ## Setup
-1. Use python -m spacy download en_core_sci_sm to download the entity identifier
-2. Use python -m venv /path/to/new/virtual/environment to open 3 new venvs in 3 different terminals. Use pip install -r requirements_"python-file-name".txt
+1. Use python -m venv /path/to/new/virtual/environment to open 3 new venvs in 3 different terminals. Use pip install -r requirements_"python-file-name".txt
+2. Use pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_sm-0.5.4.tar.gz to install the small model of scispacy. 
 3. Ensure that ollama is running llama3.2. Use ollama pull llama3.2 --> ollama run llama3.2
 4. Have access to UMLS. Create a .env and paste in UMLS_API_KEY = no quotes around api key
 5. Currently you need to run each python file one at a time - intent is to make it easier to debug with simple integration ability into single file at the end.
