@@ -1,0 +1,29 @@
+# Core dependencies for chunker.ipynb
+# =====================================
+
+# Jupyter environment
+jupyter==1.1.1
+ipykernel==6.29.5
+ipython==9.4.0
+notebook==7.4.4
+
+# PDF processing with Marker
+marker-pdf==1.8.2
+
+# LLM integration for semantic chunking
+dspy==2.6.27
+dspy-ai==2.6.27
+litellm==1.74.3
+
+# Data processing
+numpy==2.2.6
+pandas==2.3.1
+
+# Utilities
+tqdm==4.67.1
+rich==14.0.0
+python-dotenv==1.1.1
+
+# Optional: For enhanced PDF processing if needed
+# PyMuPDF==1.26.3
+# pdfplumber==0.11.7 
