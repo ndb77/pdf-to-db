@@ -15,4 +15,3 @@ Next steps, add vectorization.
 1. convert PDF to Markdown: python marker_pdf_converter "pdf of choice"
 2. convert markdown into chunked json: python chunke "name of markdown" --> json1
 3. convert chunked json into labelled entities: python entity_extraction "name of gnerated json1" --> json 2
-4. convert entities json into defined and typed entities: python entity_definition_and_semantic_type "name of gnerated json2"
