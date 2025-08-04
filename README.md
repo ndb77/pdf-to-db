@@ -1,6 +1,8 @@
 # pdf-to-db
 
 ## Setup
+** Must have 2025AA-full UMLS 30gb local data.
+0. Use semantic_types_definitions_and_cui.py <MRCONSO.RRF> <MRSTY.RRF> <MRDEF.RRF> <output_file>
 1. Use python -m venv /path/to/new/virtual/environment to open 2 new venvs in 2 different terminals. Use pip install -r requirements_"python-file-name".txt
 2. Use pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_core_sci_md-0.5.4.tar.gz to install the medium model of scispacy. 
 3. Ensure that ollama is running llama3.1:8b. Use ollama pull llama3.1 --> ollama run llama3.1:8b
