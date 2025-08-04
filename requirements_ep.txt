@@ -1,0 +1,22 @@
+# Requirements for entity_processor.py
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.21.0
+
+# NLP and entity extraction
+spacy>=3.5.0
+scispacy>=0.5.4
+
+# DSPy for LLM integration
+dspy-ai>=2.0.0
+
+# Standard library imports (no need to install)
+# json, typing, concurrent.futures, os, threading, logging, ast, re
+
+# Optional: For better performance with GPU support
+# cupy-cuda11x  # Only if using CUDA 11.x
+# cupy-cuda12x  # Only if using CUDA 12.x
+
+# Note: The following models need to be downloaded separately:
+# - en_core_sci_md: python -m spacy download en_core_sci_md
+# - en_core_sci_sm: python -m spacy download en_core_sci_sm (alternative) 

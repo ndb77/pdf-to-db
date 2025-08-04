@@ -3,9 +3,14 @@ import pandas as pd
 import spacy
 from scispacy.linking import EntityLinker
 import dspy
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import threading
 import logging
 import numpy as np
+import ast
+import re
 
 # Optimize spacy for speed
 spacy.prefer_gpu()  # Use GPU if available
@@ -20,11 +25,10 @@ class BatchEntityProcessingSignature(dspy.Signature):
     paragraph_content = dspy.InputField(desc="The full paragraph content")
     entity_list = dspy.InputField(desc="JSON list of entities detected by SciSpacy with their names and labels")
     
-    processed_entities = dspy.OutputField(desc="""Generate a JSON object with entities and relationships from the given text.
+    processed_entities = dspy.OutputField(desc="""You are a JSON-only assistant. Your goal is to generate a JSON object with entities and relationships from the given text.
 
-For each entity in the entity_list, create a description. Then identify relationships between entities.
 
-Return the JSON wrapped in a "processed_entities" field like this:
+ALWAYS respond with nothing but valid JSON that conforms to this schema:
 {
     "processed_entities": {
         "entities": [
@@ -43,6 +47,9 @@ Return the JSON wrapped in a "processed_entities" field like this:
         ]
     }
 }
+Example content:
+                                          
+They were no longer mere operatives; they had become guardians of a threshold, keepers of a message from a realm beyond stars and stripes. This elevation in their mission could not be shackled by regulations and established protocols—it demanded a new perspective, a new resolve.Tension threaded through the dialogue of beeps and static as communications with Washington buzzed in the background. The team stood, a portentous air enveloping them. It was clear that the decisions they made in the ensuing hours could redefine humanity's place in the cosmos or condemn them to ignorance and potential peril.Their connection to the stars solidified, the group moved to address the crystallizing warning, shifting from passive recipients to active participants. Mercer's latter instincts gained precedence— the team's mandate had evolved, no longer solely to observe and report but to interact and prepare. A metamorphosis had begun, and Operation: Dulce hummed with the newfound frequency of their daring, a tone set not by the earthly.
 
 Example output:
 {
@@ -51,6 +58,30 @@ Example output:
             {
                 "entity_name": "Operatives",
                 "entity_description": "Operatives initially tasked with observing and reporting, later evolved into active participants and guardians of a cosmic threshold."
+            },
+            {
+                "entity_name": "Guardians of a threshold",
+                "entity_description": "A symbolic role assumed by the team, responsible for managing a message from a realm beyond ordinary human understanding."
+            },
+            {
+                "entity_name": "Washington",
+                "entity_description": "Refers to the U.S. political and military command center with which the team maintains communication."
+            },
+            {
+                "entity_name": "Cosmos",
+                "entity_description": "The greater universe, representing the unknown or extraterrestrial domain with which the team is interacting."
+            },
+            {
+                "entity_name": "Mercer",
+                "entity_description": "A person whose instincts influenced the team's decision to shift from observation to interaction and preparation."
+            },
+            {
+                "entity_name": "Operation: Dulce",
+                "entity_description": "A codename for the evolving mission undertaken by the team, marked by increased engagement with a cosmic warning."
+            },
+            {
+                "entity_name": "Crystallizing warning",
+                "entity_description": "An emergent, urgent signal or message from beyond that prompts the team to change their role."
             }
         ],
         "relationships": [
@@ -59,12 +90,36 @@ Example output:
                 "target_entity": "Guardians of a threshold",
                 "relationship_description": "The operatives transformed into guardians, taking on a more active and protective role.",
                 "relationship_strength": 9
+            },
+            {
+                "source_entity": "Washington",
+                "target_entity": "Operatives",
+                "relationship_description": "The operatives maintained communication with Washington, suggesting oversight or coordination.",
+                "relationship_strength": 7
+            },
+            {
+                "source_entity": "Mercer",
+                "target_entity": "Team",
+                "relationship_description": "Mercer’s instincts guided the team’s shift from passive observation to proactive engagement.",
+                "relationship_strength": 8
+            },
+            {
+                "source_entity": "Operation: Dulce",
+                "target_entity": "Crystallizing warning",
+                "relationship_description": "Operation: Dulce was reoriented to respond to the emerging cosmic warning.",
+                "relationship_strength": 9
+            },
+            {
+                "source_entity": "Team",
+                "target_entity": "Cosmos",
+                "relationship_description": "The team's actions could influence humanity's place in the cosmos, implying a high-stakes relationship.",
+                "relationship_strength": 10
             }
         ]
     }
 }
 
-Return only valid JSON with the processed_entities wrapper.""")
+Remember: output ONLY JSON. For all chunks with more than 1 entity, all entities should have at least one relationship to another entity as either a source or target entity.""")
 
 class EntityProcessor:
     """Process entities from chunked JSON using SciSpacy for detection and DSPy/Ollama for descriptions."""
@@ -73,24 +128,39 @@ class EntityProcessor:
     _nlp_cache = {}
     _linker_cache = {}
     
-    def __init__(self, spacy_model: str = "en_core_sci_md", ollama_model: str = "llama3.2", 
-                 ollama_endpoint: str = "http://localhost:11434"):
+    def __init__(self, spacy_model: str = "en_core_sci_md", ollama_model: str = "llama3.1:8b", 
+                 ollama_endpoint: str = "http://localhost:11434",
+                 chunk_size: int = 25,
+                 max_workers: Optional[int] = None,
+                 progress_interval: int = 20,
+                 cache_path: str = "./cache/entity_desc_cache.json"):
         """
         Initialize the entity processor.
         
         Args:
             spacy_model: SciSpacy model to use (default: en_core_sci_md)
-            ollama_model: Ollama model to use for descriptions (default: llama3.2)
+            ollama_model: Ollama model to use for descriptions (default: llama3.1:8b)
             ollama_endpoint: Ollama endpoint URL
         """
         self.spacy_model = spacy_model
         self.ollama_model = ollama_model
         self.ollama_endpoint = ollama_endpoint
+        # Performance / config parameters
+        self.chunk_size = chunk_size
+        self.max_workers = max_workers if max_workers is not None else os.cpu_count() or 4
+        self.progress_interval = progress_interval
+        self.cache_path = cache_path
+
         self.nlp = None
         self.linker = None
         self.lm = None
         self.batch_predictor = None
         self.semantic_types = []
+
+        # Global description cache and lock
+        self.desc_cache: Dict[str, str] = {}
+        self.cache_lock = threading.Lock()
+        self._load_description_cache()
         
         # Initialize SciSpacy with entity linker (with caching)
         try:
@@ -122,7 +192,7 @@ class EntityProcessor:
                 model=ollama_model_string, 
                 api_base=self.ollama_endpoint,
                 temperature=0.0,
-                max_tokens=500
+                max_tokens=5500
             )
             dspy.settings.configure(lm=self.lm)
             self.batch_predictor = dspy.Predict(BatchEntityProcessingSignature)
@@ -177,7 +247,12 @@ class EntityProcessor:
             logger.error(f"Failed to load semantic types: {e}")
             raise
     
-    def batch_process_entities(self, paragraph_content: str, detected_entities: List[Dict]) -> Dict[str, Any]:
+    def _chunk_list(self, data_list: List[Any], chunk_size: int) -> "Generator[List[Any], None, None]":
+        """Utility to split a list into chunks of size chunk_size."""
+        for i in range(0, len(data_list), chunk_size):
+            yield data_list[i:i + chunk_size]
+
+    def batch_process_entities(self, paragraph_content: str, detected_entities: List[Dict], chunk_size: Optional[int] = None) -> Dict[str, Any]:
         """
         Process all entities in a paragraph using a single LLM call for descriptions and relationships.
         
@@ -189,97 +264,103 @@ class EntityProcessor:
             Dictionary containing processed entities and relationships
         """
         try:
-            # Prepare entity list for LLM
-            entity_input_list = []
-            for ent_data in detected_entities:
-                entity_input_list.append({
-                    "entity_name": ent_data["entity_name"],
-                    "spacy_label": ent_data["spacy_label"]
-                })
-            
-            # Convert to JSON string for LLM input
-            import json
-            entity_list_json = json.dumps(entity_input_list)
-            
-            # Make single LLM call for all entities and relationships
-            logger.info(f"Sending to LLM - paragraph_content: {paragraph_content[:100]}...")
-            logger.info(f"Sending to LLM - entity_list_json: {entity_list_json}")
-            
-            # Debug: Let's see what DSPy is actually sending to the LLM
-            try:
-                # Get the signature to see the prompt structure
-                signature = self.batch_predictor.signature
-                logger.info(f"DSPy signature: {signature}")
-                logger.info(f"Input fields: {signature.input_fields}")
-                logger.info(f"Output fields: {signature.output_fields}")
-            except Exception as e:
-                logger.warning(f"Could not inspect signature: {e}")
-            
-            result = self.batch_predictor(
-                paragraph_content=paragraph_content,
-                entity_list=entity_list_json
-            )
-            
-            logger.info(f"LLM raw response: {result.processed_entities}")
-            logger.info(f"Response type: {type(result.processed_entities)}")
-            logger.info(f"Response attributes: {dir(result)}")
-            
-            # Parse the JSON response
-            try:
-                # Try to parse the processed_entities field first
-                response_json = json.loads(result.processed_entities)
-                logger.info("Successfully parsed processed_entities field")
-                
-                # Extract the processed_entities from the wrapped response
-                if "processed_entities" in response_json:
-                    processed_data = response_json["processed_entities"]
-                    logger.info("Successfully extracted processed_entities from wrapper")
-                else:
-                    # If no wrapper, use the response directly
-                    processed_data = response_json
-                    logger.info("No wrapper found, using response directly")
+            if chunk_size is None:
+                chunk_size = self.chunk_size
+
+            # We'll aggregate results across chunks
+            aggregated_entities: List[Dict[str, Any]] = []
+            aggregated_relationships: List[Dict[str, Any]] = []
+
+            # Pre-fill entity descriptions from cache
+            entity_descriptions: Dict[str, str] = {
+                ent_name: desc for ent_name, desc in self.desc_cache.items()
+                if any(e["entity_name"] == ent_name for e in detected_entities)
+            }
+
+            # Always process ALL entities for relationships, but use cache for descriptions
+            for chunk_index, entity_chunk in enumerate(self._chunk_list(detected_entities, chunk_size)):
+                # Prepare entity list for LLM - include ALL entities for relationship generation
+                entity_input_list = [
+                    {
+                        "entity_name": ent["entity_name"],
+                        "spacy_label": ent["spacy_label"]
+                    } for ent in entity_chunk
+                ]
+
+                entity_list_json = json.dumps(entity_input_list)
+                logger.info(
+                    f"[Batch {chunk_index+1}] Sending {len(entity_chunk)} entities to LLM for relationship generation (paragraph preview: {paragraph_content[:80]}...)"
+                )
+
+                result = self.batch_predictor(
+                    paragraph_content=paragraph_content,
+                    entity_list=entity_list_json
+                )
+
+                logger.debug(f"[Batch {chunk_index+1}] LLM raw response: {result.processed_entities}")
+
+                processed_data = self._parse_llm_response(result.processed_entities)
+
+                # Always collect relationships from LLM response
+                aggregated_relationships.extend(processed_data.get("relationships", []))
+
+                # Process entities: use LLM descriptions for uncached entities, cache for cached ones
+                for entity_info in processed_data.get("entities", []):
+                    entity_name = entity_info["entity_name"]
+                    llm_description = entity_info.get("entity_description", "")
                     
-            except (json.JSONDecodeError, AttributeError) as e:
-                logger.warning(f"Failed to parse processed_entities field: {e}")
-                logger.warning(f"Raw response: {result.processed_entities}")
-                
-                # Try to parse the raw response as JSON
-                try:
-                    # If the response is already a dict object, use it directly
-                    if isinstance(result.processed_entities, dict):
-                        processed_data = result.processed_entities
-                        logger.info("Used response as dict directly")
+                    # Use cached description if available, otherwise use LLM description
+                    if entity_name in entity_descriptions:
+                        final_description = entity_descriptions[entity_name]
                     else:
-                        # Try to parse as raw JSON string
-                        processed_data = json.loads(str(result.processed_entities))
-                        logger.info("Successfully parsed raw JSON response")
-                except (json.JSONDecodeError, TypeError) as e2:
-                    logger.warning(f"Failed to parse raw JSON response: {e2}")
+                        final_description = llm_description
+                        # Update cache with new description
+                        entity_descriptions[entity_name] = final_description
+                        with self.cache_lock:
+                            self.desc_cache[entity_name] = final_description
                     
-                    # Try to convert Python dict string to JSON
-                    try:
-                        import ast
-                        # Convert Python dict string to actual dict
-                        python_dict = ast.literal_eval(str(result.processed_entities))
-                        if isinstance(python_dict, dict):
-                            processed_data = python_dict
-                            logger.info("Successfully parsed Python dict string")
-                        else:
-                            processed_data = {"entities": [], "relationships": []}
-                    except (ValueError, SyntaxError) as e3:
-                        logger.warning(f"Failed to parse Python dict: {e3}")
-                        # Fallback to empty structure
-                        processed_data = {"entities": [], "relationships": []}
-            
-            # Create mapping from entity names to descriptions
-            entity_descriptions = {}
-            for entity_info in processed_data.get("entities", []):
-                entity_descriptions[entity_info["entity_name"]] = entity_info.get("entity_description", "")
-            
+                    # Add to aggregated entities
+                    aggregated_entities.append({
+                        "entity_name": entity_name,
+                        "entity_description": final_description
+                    })
+
+            # Ensure all entities have descriptions (fallback for any missing)
+            for entity in detected_entities:
+                entity_name = entity["entity_name"]
+                if entity_name not in entity_descriptions or not entity_descriptions[entity_name]:
+                    # Fallback single-entity call to ensure description
+                    single_entity_payload = json.dumps([
+                        {"entity_name": entity_name, "spacy_label": entity["spacy_label"]}
+                    ])
+                    single_result = self.batch_predictor(
+                        paragraph_content=paragraph_content,
+                        entity_list=single_entity_payload
+                    )
+                    single_data = self._parse_llm_response(single_result.processed_entities)
+                    if single_data.get("entities"):
+                        description = single_data["entities"][0].get("entity_description", "")
+                    else:
+                        description = ""
+                    entity_descriptions[entity_name] = description
+                    # Update cache
+                    with self.cache_lock:
+                        self.desc_cache[entity_name] = description
+                    
+                    # Add to aggregated entities if not already present
+                    if not any(e["entity_name"] == entity_name for e in aggregated_entities):
+                        aggregated_entities.append({
+                            "entity_name": entity_name,
+                            "entity_description": description
+                        })
+
+            # Persist cache after updates
+            self._save_description_cache()
+
             # Return processed entities with descriptions and relationships
             return {
                 "entity_descriptions": entity_descriptions,
-                "relationships": processed_data.get("relationships", [])
+                "relationships": aggregated_relationships
             }
             
         except Exception as e:
@@ -292,6 +373,108 @@ class EntityProcessor:
                 "relationships": []
             }
 
+    def _parse_llm_response(self, raw) -> dict:
+        """
+        Attempts to coerce the LLM output into a Python dict.
+        1.  Accepts already-parsed dicts
+        2.  Strips ``` fences and leading labels
+        3.  First tries json.loads
+        4.  Then fixes single→double quotes and retries json.loads
+        5.  Finally falls back to ast.literal_eval
+        6.  Always returns {'entities': [], 'relationships': []} shape
+        """
+        # 0. If DSPy already returned a dict we're done
+        if isinstance(raw, dict):
+            data = raw
+        else:
+            txt = str(raw).strip()
+
+            # Drop code fences or leading markdown
+            txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.IGNORECASE).strip()
+
+            # 1st attempt – vanilla JSON
+            try:
+                data = json.loads(txt)
+            except json.JSONDecodeError:
+                # 2nd attempt – replace single quotes
+                try:
+                    data = json.loads(txt.replace("'", '"'))
+                except json.JSONDecodeError:
+                    # 3rd attempt – Python literal
+                    try:
+                        data = ast.literal_eval(txt)
+                    except Exception:
+                        logger.warning("Unable to parse LLM response, returning empty shell")
+                        data = {}
+
+        # Unwrap if the model kept the outer key
+        if "processed_entities" in data:
+            data = data["processed_entities"]
+
+        # Guarantee keys exist
+        return {
+            "entities": data.get("entities", []),
+            "relationships": data.get("relationships", [])
+        }
+
+    # ------------------ Cache helpers ------------------
+    def _load_description_cache(self) -> None:
+        """Load entity description cache from disk if it exists."""
+        try:
+            cache_dir = os.path.dirname(self.cache_path)
+            os.makedirs(cache_dir, exist_ok=True)
+            if os.path.exists(self.cache_path):
+                with open(self.cache_path, "r", encoding="utf-8") as f:
+                    self.desc_cache = json.load(f)
+                    logger.info(f"✓ Loaded description cache with {len(self.desc_cache)} entries")
+        except Exception as e:
+            logger.warning(f"Failed to load description cache: {e}")
+            self.desc_cache = {}
+
+    def _save_description_cache(self) -> None:
+        """Persist the description cache to disk (thread-safe)."""
+        try:
+            with self.cache_lock:
+                cache_dir = os.path.dirname(self.cache_path)
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(self.cache_path, "w", encoding="utf-8") as f:
+                    json.dump(self.desc_cache, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save description cache: {e}")
+
+    def _save_progress(self, results: Dict[str, Any], current_paragraph: int, total_paragraphs: int) -> None:
+        """
+        Save current processing progress to a JSON file.
+        
+        Args:
+            results: Current processing results
+            current_paragraph: Number of paragraphs processed so far
+            total_paragraphs: Total number of paragraphs to process
+        """
+        try:
+            # Create progress filename with timestamp
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            progress_filename = f"entity_processing_progress_{timestamp}.json"
+            
+            # Add progress metadata
+            progress_results = results.copy()
+            progress_results['progress_metadata'] = {
+                'paragraphs_processed': current_paragraph,
+                'total_paragraphs': total_paragraphs,
+                'completion_percentage': round((current_paragraph / total_paragraphs) * 100, 2),
+                'saved_at': timestamp,
+                'status': 'in_progress'
+            }
+            
+            # Save to file
+            with open(progress_filename, 'w', encoding='utf-8') as f:
+                json.dump(progress_results, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"✓ Progress saved: {progress_filename} ({current_paragraph}/{total_paragraphs} paragraphs, {progress_results['progress_metadata']['completion_percentage']}% complete)")
+            
+        except Exception as e:
+            logger.warning(f"Failed to save progress: {e}")
     
     def generate_entity_description(self, entity_name: str, context_content: str, spacy_label: str) -> str:
         """
@@ -404,7 +587,7 @@ class EntityProcessor:
                 entity_name = entity['entity_name']
                 
                 # Get description from batch processing or fallback
-                entity_description = entity_descriptions.get(entity_name, f"A {entity['spacy_label'].lower().replace('_', ' ')} entity")
+                entity_description = entity_descriptions.get(entity_name, "")
                 
                 final_entity = {
                     'entity_name': entity_name,
@@ -435,6 +618,7 @@ class EntityProcessor:
     def process_chunked_json(self, json_path: str, max_paragraphs: int = 20) -> Dict[str, Any]:
         """
         Process the chunked JSON file and extract entities from the first N paragraphs.
+        Saves progress every 10 paragraphs to prevent data loss.
         
         Args:
             json_path: Path to the chunked JSON file
@@ -476,33 +660,36 @@ class EntityProcessor:
                 'paragraphs': []
             }
             
-            for i, paragraph in enumerate(paragraphs_to_process):
-                logger.info(f"Processing paragraph {i+1}/{len(paragraphs_to_process)}")
-                
-                # Extract entities and relationships
+            def _process_single(idx_paragraph):
+                idx, paragraph = idx_paragraph
+                logger.info(f"[Thread] Processing paragraph {idx+1}/{len(paragraphs_to_process)}")
                 extraction_results = self.extract_entities_from_paragraph(paragraph['content'])
                 entities = extraction_results.get('entities', [])
                 relationships = extraction_results.get('relationships', [])
-                
-                paragraph_result = {
-                    'paragraph_index': i + 1,
-                    'chunk_number': paragraph['chunk_number'],
-                    'content': paragraph['content'],
-                    'entities': entities,
-                    'entity_count': len(entities),
-                    'relationships': relationships,
-                    'relationship_count': len(relationships)
-                }
-                
-                results['paragraphs'].append(paragraph_result)
-                
-                # Log progress
-                if entities:
-                    logger.info(f"  Found {len(entities)} entities and {len(relationships)} relationships")
-                    for entity in entities[:3]:  # Show first 3 entities
-                        logger.info(f"    - {entity['entity_name']} ({entity['entity_type']}) [{entity['spacy_label']}]")
-                else:
-                    logger.info("  No entities found")
+                return idx, paragraph, entities, relationships
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                for idx, paragraph, entities, relationships in executor.map(_process_single, enumerate(paragraphs_to_process)):
+                    paragraph_result = {
+                        'paragraph_index': idx + 1,
+                        'chunk_number': paragraph['chunk_number'],
+                        'content': paragraph['content'],
+                        'entities': entities,
+                        'entity_count': len(entities),
+                        'relationships': relationships,
+                        'relationship_count': len(relationships)
+                    }
+                    results['paragraphs'].append(paragraph_result)
+
+                    # Log progress (main thread)
+                    if entities:
+                        logger.info(f"  Found {len(entities)} entities and {len(relationships)} relationships in paragraph {idx+1}")
+                    else:
+                        logger.info(f"  No entities found in paragraph {idx+1}")
+
+                    # Save progress every self.progress_interval paragraphs
+                    if (idx + 1) % self.progress_interval == 0:
+                        self._save_progress(results, idx + 1, len(paragraphs_to_process))
             
             return results
             
@@ -511,7 +698,7 @@ class EntityProcessor:
             raise
 
 def entity_processor(json_path: str, txt_path: str, max_paragraphs: int = 20, 
-                    spacy_model: str = "en_core_sci_md", ollama_model: str = "llama3.2",
+                    spacy_model: str = "en_core_sci_md", ollama_model: str = "llama3.1:8b",
                     ollama_endpoint: str = "http://localhost:11434") -> Dict[str, Any]:
     """
     Main function to process entities from chunked JSON using SciSpacy for detection and DSPy/Ollama for descriptions.
@@ -521,7 +708,7 @@ def entity_processor(json_path: str, txt_path: str, max_paragraphs: int = 20,
         txt_path: Path to the semantic types text file (pipe-delimited)
         max_paragraphs: Maximum number of paragraphs to process (default: 20)
         spacy_model: SciSpacy model to use (default: en_core_sci_md)
-        ollama_model: Ollama model to use for descriptions (default: llama3.2)
+        ollama_model: Ollama model to use for descriptions (default: llama3.1:8b)
         ollama_endpoint: Ollama endpoint URL
         
     Returns:
@@ -540,6 +727,16 @@ def entity_processor(json_path: str, txt_path: str, max_paragraphs: int = 20,
         
         # Process the JSON file
         results = processor.process_chunked_json(json_path, max_paragraphs)
+        
+        # Add completion metadata
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        results['completion_metadata'] = {
+            'completed_at': timestamp,
+            'status': 'completed',
+            'total_entities_found': sum(len(p.get('entities', [])) for p in results.get('paragraphs', [])),
+            'total_relationships_found': sum(len(p.get('relationships', [])) for p in results.get('paragraphs', []))
+        }
         
         logger.info("✓ Entity processing completed successfully")
         return results
@@ -560,7 +757,7 @@ if __name__ == "__main__":
     txt_path = sys.argv[2]
     max_paragraphs = int(sys.argv[3]) if len(sys.argv) > 3 else 20
     spacy_model = sys.argv[4] if len(sys.argv) > 4 else "en_core_sci_md"
-    ollama_model = sys.argv[5] if len(sys.argv) > 5 else "llama3.2"
+    ollama_model = sys.argv[5] if len(sys.argv) > 5 else "llama3.1:8b"
     
     try:
         results = entity_processor(json_path, txt_path, max_paragraphs, spacy_model, ollama_model)
