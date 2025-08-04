@@ -11,6 +11,8 @@ import logging
 import numpy as np
 import ast
 import re
+from embedding_pipeline import BioMedBERTEmbedder
+
 
 # Optimize spacy for speed
 spacy.prefer_gpu()  # Use GPU if available
@@ -200,6 +202,15 @@ class EntityProcessor:
         except Exception as e:
             logger.error(f"Failed to initialize DSPy with Ollama: {e}")
             raise RuntimeError(f"Could not initialize DSPy with Ollama model {ollama_model}")
+        
+        # Initialize BioMedBERT embedder for entity embeddings
+        try:
+            self.embedder = BioMedBERTEmbedder(batch_size=32)  # Smaller batch size for memory efficiency
+            logger.info(f"✓ BioMedBERT embedder initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize BioMedBERT embedder: {e}")
+            logger.warning("Continuing without embedding functionality")
+            self.embedder = None
     
     def load_semantic_types(self, txt_path: str) -> None:
         """
@@ -310,6 +321,7 @@ class EntityProcessor:
                     llm_description = entity_info.get("entity_description", "")
                     
                     # Use cached description if available, otherwise use LLM description
+                    entity_type = entity_info.get("entity_type", "")
                     if entity_name in entity_descriptions:
                         final_description = entity_descriptions[entity_name]
                     else:
@@ -318,12 +330,26 @@ class EntityProcessor:
                         entity_descriptions[entity_name] = final_description
                         with self.cache_lock:
                             self.desc_cache[entity_name] = final_description
-                    
                     # Add to aggregated entities
                     aggregated_entities.append({
                         "entity_name": entity_name,
                         "entity_description": final_description
                     })
+                    
+                    # Compute embeddings for the entity if embedder is available
+                    if self.embedder is not None:
+                        try:
+                            # Find the original entity to get entity_type
+                            original_entity = next((e for e in detected_entities if e["entity_name"] == entity_name), None)
+                            if original_entity:
+                                entity_type = original_entity.get("entity_type", "Entity")
+                                entity_embedding = self.embedder.encode_entity(entity_name, entity_type, final_description)
+                                # Add the embedding to the aggregated entities
+                                aggregated_entities[-1]["embedding"] = entity_embedding.tolist()
+                        except Exception as e:
+                            logger.warning(f"Failed to compute embedding for entity '{entity_name}': {e}")
+                    else:
+                        logger.debug("Embedder not available, skipping embedding computation")
 
             # Ensure all entities have descriptions (fallback for any missing)
             for entity in detected_entities:
@@ -353,13 +379,24 @@ class EntityProcessor:
                             "entity_name": entity_name,
                             "entity_description": description
                         })
+                        
+                        # Compute embeddings for fallback entities if embedder is available
+                        if self.embedder is not None:
+                            try:
+                                entity_type = entity.get("entity_type", "Entity")
+                                entity_embedding = self.embedder.encode_entity(entity_name, entity_type, description)
+                                # Add the embedding to the aggregated entities
+                                aggregated_entities[-1]["embedding"] = entity_embedding.tolist()
+                            except Exception as e:
+                                logger.warning(f"Failed to compute embedding for fallback entity '{entity_name}': {e}")
 
             # Persist cache after updates
             self._save_description_cache()
 
-            # Return processed entities with descriptions and relationships
+            # Return processed entities with descriptions, embeddings, and relationships
             return {
                 "entity_descriptions": entity_descriptions,
+                "entities_with_embeddings": aggregated_entities,
                 "relationships": aggregated_relationships
             }
             
@@ -579,15 +616,24 @@ class EntityProcessor:
             # Second pass: Use batch LLM processing for descriptions and relationships
             batch_results = self.batch_process_entities(paragraph_content, unique_detected_entities)
             
-            # Combine SciSpacy data with LLM results
+            # Combine SciSpacy data with LLM results and embeddings
             final_entities = []
             entity_descriptions = batch_results.get("entity_descriptions", {})
+            entities_with_embeddings = batch_results.get("entities_with_embeddings", [])
+            
+            # Create a lookup for entities with embeddings
+            embedding_lookup = {e["entity_name"]: e for e in entities_with_embeddings}
             
             for entity in unique_detected_entities:
                 entity_name = entity['entity_name']
                 
                 # Get description from batch processing or fallback
                 entity_description = entity_descriptions.get(entity_name, "")
+                
+                # Get embedding if available
+                embedding = None
+                if entity_name in embedding_lookup:
+                    embedding = embedding_lookup[entity_name].get("embedding")
                 
                 final_entity = {
                     'entity_name': entity_name,
@@ -601,6 +647,11 @@ class EntityProcessor:
                     'end_char': entity['end_char'],
                     'is_clinically_relevant': entity['is_clinically_relevant']
                 }
+                
+                # Add embedding if available
+                if embedding is not None:
+                    final_entity['embedding'] = embedding
+                
                 final_entities.append(final_entity)
             
             return {
