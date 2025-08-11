@@ -54,6 +54,7 @@ class BioMedBERTEmbedder:
     ):  # noqa: D401 – simple property
         self.batch_size = batch_size
         self.normalize = normalize
+        self.model_name = model_name
 
         # Auto-select device if none provided
         if device is None:

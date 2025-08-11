@@ -9,14 +9,19 @@ logger = logging.getLogger(__name__)
 class MedicalSummarySignature(dspy.Signature):
     """DSPy signature for generating structured medical summaries from text chunks with entities and relationships."""
     
-    chunk_content = dspy.InputField(desc="The full text content of the medical chunk/paragraph")
+    chunk_content = dspy.InputField(desc="The full text content of the medical chunk/paragraph. Example: After heart surgery for infection, the patient admitted alcohol abuse. A stethoscope exam was unremarkable. Cholesterol test increased to 150 mg/dL; blood pressure measured 120/80. Aspirin therapy was initiated.")
     entities_data = dspy.InputField(desc="JSON string containing the entities and relationships extracted from the chunk")
     
-    medical_summary = dspy.OutputField(desc=""" You are a medical summarizer. Generate a structured summary from the provided medical source (report, paper, or book), strictly adhering to the following categories. The summary should list key information under each category in a concise format. Summaries should be based off of the entities and relationships extracted from the chunk. No additional explanations or detailed descriptions are necessary unless directly related to the categories:
+    medical_summary = dspy.OutputField(desc="""You are a medical summarizer. Generate a structured summary using ONLY the entities and relationships provided in the entities_data JSON.
 
-Each category should be addressed only if relevant to the content of the medical source. Ensure the summary is clear and direct, suitable for quick reference.
+IMPORTANT: Base your summary ENTIRELY on the entities and relationships provided. Each entity has:
+- entity_name: the medical term/concept
+- entity_type: the category (e.g., Drug, Procedure, Disease, Anatomical Structure)
+- entity_description: detailed description
 
-Respond with the medical summary as a JSON string in this exact format, not python code or anything else. Items within angle brackets are instructions for you to fill in for that category and should not be included in the final output:
+Use the entity_type to determine which category each entity belongs to. Use relationships to understand connections between entities.
+
+Respond with ONLY a JSON string in this exact format (fill in relevant values based on entities, leave empty string for missing):
 {
   "ANATOMICAL_STRUCTURE": <Mention any anatomical structures specifically discussed>,
   "BODY_FUNCTION": <List any body functions highlighted>,
@@ -47,13 +52,19 @@ Respond with the medical summary as a JSON string in this exact format, not pyth
   "SUBSTANCE_ABUSE": <Note any substance abuse mentioned>
 }
 Remember to follow the instructions in the angle brackets and remove any angle brackets from the final JSON string response.
-
 Example:
 {
     "ANATOMICAL_STRUCTURE": "heart",
     "MEDICINE": "aspirin",
     "PROBLEM": "infection",
     "PROCEDURE": "surgery"
+    "MEDICAL_DEVICE": "stethoscope"
+    "SUBSTANCE_ABUSE": "alcohol"
+    "LABORATORY_DATA": "cholesterol test"
+    "LAB_RESULT": "increased"
+    "LAB_VALUE": "150"
+    "LAB_UNIT": "mg/dL"
+    "BM_RESULT": "120/80"
 }                                    
 """)
 
@@ -70,7 +81,7 @@ class MedicalSummarySlimSignature(dspy.Signature):
 class EntitySummarizer:
     """Generate structured medical summaries from processed chunks using DSPy and LLM."""
     
-    def __init__(self, ollama_model: str = "llama3.1:8b", ollama_endpoint: str = "http://localhost:11434"):
+    def __init__(self, ollama_model: str = "llama3.1:8b", ollama_endpoint: str = "http://localhost:11434", provider: str = "ollama", model_id: Optional[str] = None):
         """
         Initialize the Entity Summarizer.
         
@@ -78,24 +89,78 @@ class EntitySummarizer:
             ollama_model: Ollama model to use for summarization (default: llama3.1:8b)
             ollama_endpoint: Ollama endpoint URL
         """
-        self.ollama_model = ollama_model
+        # Provider/model selection
+        self.provider = provider
+        self.ollama_model = model_id or ollama_model
         self.ollama_endpoint = ollama_endpoint
+        self.hf_pipeline = None
         
-        # Initialize DSPy with Ollama for summarization
+        # Initialize LLM backend for summarization
         try:
-            ollama_model_string = f"ollama/{self.ollama_model}"
-            self.lm = dspy.LM(
-                model=ollama_model_string, 
-                api_base=self.ollama_endpoint,
-                temperature=0.5,  # Lower temperature for more consistent structured output
-                max_tokens=500   # Increased for larger entity sets and relationships
-            )
-            dspy.settings.configure(lm=self.lm)
-            self.summary_predictor = dspy.Predict(MedicalSummarySignature)
-            logger.info(f"✓ EntitySummarizer initialized with Ollama model: {self.ollama_model}")
+            if self.provider == "hf":
+                from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, pipeline
+                import torch
+                model_id_resolved = self.ollama_model
+                logger.info(f"Initializing HF summarizer model: {model_id_resolved}")
+                tokenizer = AutoTokenizer.from_pretrained(model_id_resolved, trust_remote_code=True)
+
+                # Capability checks
+                has_accelerate = False
+                try:
+                    import accelerate  # noqa: F401
+                    has_accelerate = True
+                except Exception:
+                    has_accelerate = False
+
+                # Determine 4-bit support without importing bitsandbytes (avoid metadata errors)
+                import importlib.util
+                supports_bnb_4bit = False  # Force-disable 4-bit to avoid bitsandbytes
+
+                load_kwargs = {"trust_remote_code": True}
+                pipeline_kwargs = {"do_sample": True, "temperature": 0.3}
+
+                if torch.cuda.is_available():
+                    if has_accelerate:
+                        load_kwargs.update({"torch_dtype": torch.float16, "device_map": "auto"})
+                        logger.info("✓ CUDA available; loading FP16 with device_map=auto")
+                    else:
+                        load_kwargs.update({"torch_dtype": torch.float16})
+                        logger.info("✓ CUDA available; loading FP16 without device_map (install 'accelerate' for sharding)")
+                        pipeline_kwargs["device"] = 0
+                else:
+                    logger.info("ℹ️ CUDA not available; loading on CPU (may be slow)")
+                    pipeline_kwargs["device"] = -1
+
+                # Load and sanitize config to ignore any baked-in 4-bit quantization hints
+                try:
+                    config = AutoConfig.from_pretrained(model_id_resolved, trust_remote_code=True)
+                    if hasattr(config, "quantization_config"):
+                        setattr(config, "quantization_config", None)
+                except Exception:
+                    config = None
+
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id_resolved,
+                    config=config,
+                    **load_kwargs,
+                )
+                self.hf_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer, **pipeline_kwargs)
+                self.summary_predictor = None
+                logger.info("✓ HF summarizer initialized")
+            else:
+                ollama_model_string = f"ollama/{self.ollama_model}"
+                self.lm = dspy.LM(
+                    model=ollama_model_string, 
+                    api_base=self.ollama_endpoint,
+                    temperature=0.5,
+                    max_tokens=500
+                )
+                dspy.settings.configure(lm=self.lm)
+                self.summary_predictor = dspy.Predict(MedicalSummarySignature)
+                logger.info(f"✓ EntitySummarizer initialized with Ollama model: {self.ollama_model}")
         except Exception as e:
-            logger.error(f"Failed to initialize EntitySummarizer with Ollama: {e}")
-            raise RuntimeError(f"Could not initialize EntitySummarizer with Ollama model {ollama_model}")
+            logger.error(f"Failed to initialize EntitySummarizer: {e}")
+            raise RuntimeError("Could not initialize summarizer backend")
     
     def _parse_summary_response(self, raw_response: str) -> Dict[str, str]:
         """
@@ -177,6 +242,104 @@ class EntitySummarizer:
             logger.warning(f"Failed to parse summary response: {e}")
             return {}
     
+    def _create_enhanced_summary_prompt(self, chunk_content: str, entities: List[Dict[str, Any]], 
+                                       relationships: List[Dict[str, Any]]) -> str:
+        """Create an enhanced prompt that emphasizes entity and relationship information."""
+        # Create entity summary by type
+        entity_by_type = {}
+        for ent in entities:
+            etype = ent.get('entity_type', 'Unknown')
+            if etype not in entity_by_type:
+                entity_by_type[etype] = []
+            entity_by_type[etype].append({
+                'name': ent.get('entity_name', ''),
+                'description': ent.get('entity_description', '')
+            })
+        
+        # Format entities by type
+        entity_summary = "ENTITIES BY TYPE:\n"
+        for etype, ents in entity_by_type.items():
+            entity_summary += f"\n{etype}:\n"
+            for e in ents:
+                entity_summary += f"  - {e['name']}: {e['description']}\n"
+        
+        # Format relationships
+        relationship_summary = "\nRELATIONSHIPS:\n"
+        if relationships:
+            for rel in relationships:
+                relationship_summary += f"  - {rel.get('source_entity', '')} -> {rel.get('target_entity', '')}: {rel.get('relationship_description', '')}\n"
+        else:
+            relationship_summary += "  None identified\n"
+        
+        # Combine into enhanced prompt
+        enhanced = f"{chunk_content}\n\n{entity_summary}\n{relationship_summary}"
+        return enhanced[:3000]  # Limit length to avoid token limits
+    
+    def _generate_entity_based_summary(self, entities: List[Dict[str, Any]], 
+                                      relationships: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Generate a medical summary directly from entities and relationships."""
+        summary = {}
+        
+        # Process entities by type
+        for ent in entities:
+            etype = ent.get('entity_type', '').lower()
+            name = ent.get('entity_name', '')
+            desc = ent.get('entity_description', '')
+            
+            # Map entity types to medical categories
+            if any(term in etype for term in ['drug', 'medication', 'pharmaceutical', 'chemical']):
+                existing = summary.get('MEDICINE', '')
+                summary['MEDICINE'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['procedure', 'surgery', 'treatment', 'therapeutic']):
+                existing = summary.get('PROCEDURE', '')
+                summary['PROCEDURE'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['disease', 'disorder', 'syndrome', 'condition', 'problem']):
+                existing = summary.get('PROBLEM', '')
+                summary['PROBLEM'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['anatomical', 'organ', 'body part', 'tissue']):
+                existing = summary.get('ANATOMICAL_STRUCTURE', '')
+                summary['ANATOMICAL_STRUCTURE'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['laboratory', 'test', 'diagnostic']):
+                existing = summary.get('LABORATORY_DATA', '')
+                summary['LABORATORY_DATA'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['device', 'equipment', 'instrument']):
+                existing = summary.get('MEDICAL_DEVICE', '')
+                summary['MEDICAL_DEVICE'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['substance abuse', 'addiction', 'alcohol', 'drug abuse']):
+                existing = summary.get('SUBSTANCE_ABUSE', '')
+                summary['SUBSTANCE_ABUSE'] = f"{existing}, {name}" if existing else name
+                
+            elif any(term in etype for term in ['function', 'process', 'activity']):
+                existing = summary.get('BODY_FUNCTION', '')
+                summary['BODY_FUNCTION'] = f"{existing}, {name}" if existing else name
+        
+        # Add relationship context
+        if relationships:
+            # Look for specific patterns in relationships
+            for rel in relationships:
+                rel_desc = rel.get('relationship_description', '').lower()
+                source = rel.get('source_entity', '')
+                target = rel.get('target_entity', '')
+                
+                # Extract additional context from relationships
+                if 'treats' in rel_desc or 'used for' in rel_desc:
+                    if 'MEDICINE' not in summary:
+                        summary['MEDICINE'] = source
+                    if 'PROBLEM' not in summary:
+                        summary['PROBLEM'] = target
+                        
+                elif 'performed' in rel_desc or 'diagnose' in rel_desc:
+                    if 'PROCEDURE' not in summary:
+                        summary['PROCEDURE'] = source
+        
+        return summary
+    
     def _heuristic_summary_from_entities(self, entities: List[Dict[str, Any]]) -> Dict[str, str]:
         """Generate a simple summary using entity types when the LLM fails."""
         summary: Dict[str, List[str]] = {}
@@ -243,10 +406,82 @@ class EntitySummarizer:
             logger.debug(f"Generating medical summary for chunk (length: {len(chunk_content)} chars, "
                         f"{len(entities)} entities, {len(relationships)} relationships)")
             
-            # Generate summary using DSPy
+            # Generate summary using HF pipeline if configured
+            if self.hf_pipeline is not None:
+                try:
+                    instruction = (
+                        "You are a medical summarizer. Extract medical information from the text and entities. "
+                        "Return ONLY valid JSON with the exact keys listed. Fill in relevant values, leave empty string for missing info. "
+                        "Do not include any text before or after the JSON."
+                    )
+                    schema = (
+                        '{\n'
+                        '  "ANATOMICAL_STRUCTURE": "",\n'
+                        '  "BODY_FUNCTION": "",\n'
+                        '  "BODY_MEASUREMENT": "",\n'
+                        '  "BM_RESULT": "",\n'
+                        '  "BM_UNIT": "",\n'
+                        '  "BM_VALUE": "",\n'
+                        '  "LABORATORY_DATA": "",\n'
+                        '  "LAB_RESULT": "",\n'
+                        '  "LAB_VALUE": "",\n'
+                        '  "LAB_UNIT": "",\n'
+                        '  "MEDICINE": "",\n'
+                        '  "MED_DOSE": "",\n'
+                        '  "MED_DURATION": "",\n'
+                        '  "MED_FORM": "",\n'
+                        '  "MED_FREQUENCY": "",\n'
+                        '  "MED_ROUTE": "",\n'
+                        '  "MED_STATUS": "",\n'
+                        '  "MED_STRENGTH": "",\n'
+                        '  "MED_UNIT": "",\n'
+                        '  "MED_TOTALDOSE": "",\n'
+                        '  "PROBLEM": "",\n'
+                        '  "PROCEDURE": "",\n'
+                        '  "PROCEDURE_RESULT": "",\n'
+                        '  "PROC_METHOD": "",\n'
+                        '  "SEVERITY": "",\n'
+                        '  "MEDICAL_DEVICE": "",\n'
+                        '  "SUBSTANCE_ABUSE": ""\n'
+                        '}'
+                    )
+                    prompt = (
+                        f"{instruction}\n\n"
+                        f"Source text:\n{chunk_content}\n\n"
+                        f"Entities and relationships (JSON):\n{entities_json}\n\n"
+                        f"Respond with JSON only and follow this schema (use empty strings for missing fields):\n{schema}"
+                    )
+                    pad_id = getattr(self.hf_pipeline.tokenizer, 'eos_token_id', None)
+                    gen_kwargs = {
+                        'max_new_tokens': 600,
+                        'return_full_text': False,
+                        'do_sample': False,
+                        'temperature': 0.0,
+                    }
+                    if pad_id is not None:
+                        gen_kwargs['pad_token_id'] = pad_id
+                        gen_kwargs['eos_token_id'] = pad_id
+                    outputs = self.hf_pipeline(prompt, **gen_kwargs)
+                    raw_response = outputs[0].get('generated_text', '')
+                    summary = self._parse_summary_response(raw_response)
+                    if not summary:
+                        logging.getLogger("entity_processor1").warning(
+                            "HF summarizer returned no JSON summary – skipping fallback and logging only"
+                        )
+                        return {}
+                    logger.debug(f"Generated medical summary with {len(summary)} relevant categories (HF)")
+                    return summary
+                except Exception as hf_error:
+                    logger.warning(f"HF summarization failed: {hf_error}")
+                    return {}
+
+            # Generate summary using DSPy (Ollama) when HF is not configured
             try:
+                # Create a more detailed prompt that emphasizes using entity information
+                enhanced_prompt = self._create_enhanced_summary_prompt(chunk_content, filtered_entities, filtered_relationships)
+                
                 result = self.summary_predictor(
-                    chunk_content=chunk_content,
+                    chunk_content=enhanced_prompt,
                     entities_data=entities_json
                 )
                 
@@ -264,8 +499,15 @@ class EntitySummarizer:
                 summary = self._parse_summary_response(raw_response)
                 
                 if not summary:
-                    logger.warning("LLM medical summary empty – generating heuristic fallback from entities")
-                    summary = self._heuristic_summary_from_entities(filtered_entities)
+                    # Try a more direct approach with entity-based summary
+                    logger.debug("Attempting entity-based summary generation")
+                    summary = self._generate_entity_based_summary(filtered_entities, filtered_relationships)
+                    
+                if not summary:
+                    logging.getLogger("entity_processor1").warning(
+                        "LLM medical summary empty – skipping fallback summary and logging only"
+                    )
+                    return {}
                 else:
                     logger.debug(f"Generated medical summary with {len(summary)} relevant categories")
                 return summary
